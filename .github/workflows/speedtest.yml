@@ -1,186 +1,203 @@
-name: Build & run net_bench (inline source)
+# Имя рабочего процесса, которое будет отображаться в GitHub Actions
+name: Network Throughput Test
 
+# Триггеры для запуска:
+# - push: при любом пуше в ветку main
+# - workflow_dispatch: позволяет запускать вручную со страницы Actions в GitHub
 on:
   push:
-    branches: [ main ]
-  pull_request:
     branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  build-and-test:
+  # Название задачи
+  build-and-run-test:
+    # Запускать на последней доступной виртуальной машине с Ubuntu
     runs-on: ubuntu-latest
 
     steps:
-      # 0) (необязательно) чекаутим репо, вдруг там ещё что-то важно
-      - name: Checkout (optional)
-        uses: actions/checkout@v3
+      # Шаг 1: Установка зависимостей (gcc и другие утилиты для сборки)
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y build-essential
 
-      # 1) Создаём исходник net_bench.c прямо в раннере
-      - name: Create net_bench.c
-        shell: bash
+      # Шаг 2: Создание файла с исходным кодом C
+      # Используется here-document (cat <<'EOF' ... EOF), чтобы легко вставить
+      # многострочный код в файл. Кавычки вокруг 'EOF' предотвращают
+      # интерпретацию специальных символов оболочкой.
+      - name: Create C source file
         run: |
-          cat > net_bench.c <<'C_EOF'
+          cat <<'EOF' > network_test.c
           #define _GNU_SOURCE
-          #include <arpa/inet.h>
-          #include <errno.h>
-          #include <fcntl.h>
-          #include <netdb.h>
-          #include <netinet/tcp.h>
-          #include <pthread.h>
-          #include <sched.h>
-          #include <stdint.h>
           #include <stdio.h>
           #include <stdlib.h>
           #include <string.h>
-          #include <sys/socket.h>
-          #include <sys/time.h>
-          #include <sys/types.h>
-          #include <time.h>
+          #include <pthread.h>
           #include <unistd.h>
+          #include <sys/socket.h>
+          #include <netinet/in.h>
+          #include <netdb.h>
+          #include <time.h>
+          #include <errno.h>
 
-          #ifndef  THREADS
-          #   define THREADS 4
-          #endif
-          #ifndef  BYTES_PER_THREAD
-          #   define BYTES_PER_THREAD (1ULL<<30)
-          #endif
           #define HOST "speed.cloudflare.com"
-          #define PORT "80"
-          #define PATH "/__down?bytes="
+          #define PORT 80
+          #define PATH_TEMPLATE "/__down?bytes=%llu"
+          #define TOTAL_BYTES (2ULL * 1024 * 1024 * 1024) // 2 GB
+          #define NUM_THREADS 4
+          #define BUFFER_SIZE (1024 * 1024) // 1 MB
 
-          #define BUF_SZ   (1<<20)
-          #define SO_BUF   (1<<22)
-
-          static inline double nsec(const struct timespec *t)
-          {
-              return t->tv_sec + t->tv_nsec * 1e-9;
-          }
-
+          // Структура для передачи данных в поток
           typedef struct {
-              uint64_t target;
-              uint64_t received;
-              double   dur;
-              int      id;
-          } tstat_t;
+              int thread_id;
+              unsigned long long bytes_to_download;
+              long long downloaded_bytes;
+              char path[256]; // <-- ИСПРАВЛЕНО: добавлено это поле
+          } thread_data_t;
 
-          /* —————————————————————————————————————————————————————————————————— */
-          static int fetch_bytes(uint64_t nbytes)
-          {
-              struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
-              struct addrinfo *rp, *res;
-              if (getaddrinfo(HOST, PORT, &hints, &res)) return -1;
-
-              int s = -1;
-              for (rp = res; rp; rp = rp->ai_next) {
-                  s = socket(rp->ai_family, rp->ai_socktype | SOCK_CLOEXEC, rp->ai_protocol);
-                  if (s == -1) continue;
-                  setsockopt(s, IPPROTO_TCP, TCP_NODELAY,  &(int){1}, 4);
-                  setsockopt(s, SOL_SOCKET,  SO_RCVBUF,    &(int){SO_BUF}, 4);
-                  if (!connect(s, rp->ai_addr, rp->ai_addrlen)) break;
-                  close(s); s = -1;
-              }
-              freeaddrinfo(res);
-              if (s == -1) return -1;
-
-              char req[128];
-              int len = snprintf(req, sizeof(req),
-                                 "GET %s%lu HTTP/1.1\r\n"
-                                 "Host: " HOST "\r\n"
-                                 "Connection: close\r\n\r\n",
-                                 PATH, (unsigned long)nbytes);
-              if (write(s, req, len) != len) { close(s); return -1; }
-
-              static char *buf;
-              if (!buf && !(buf = aligned_alloc(64, BUF_SZ))) { close(s); return -1; }
-
-              size_t header_end = 0;
-              while (!header_end) {
-                  ssize_t r = read(s, buf, BUF_SZ);
-                  if (r <= 0) { close(s); return -1; }
-                  for (ssize_t i = 3; i < r; ++i)
-                      if (buf[i-3]=='\r' && buf[i-2]=='\n' &&
-                          buf[i-1]=='\r' && buf[i]=='\n') { header_end = i+1; nbytes -= (r - header_end); break; }
-              }
-
-              uint64_t got = 0;
-              while (got < nbytes) {
-                  ssize_t r = read(s, buf, BUF_SZ);
-                  if (r <= 0) break;
-                  got += r;
-              }
-              close(s);
-              return (got >= nbytes) ? 0 : -1;
+          // Функция для обработки ошибок
+          void error(const char *msg) {
+              perror(msg);
+              exit(EXIT_FAILURE);
           }
-          /* —————————————————————————————————————————————————————————————————— */
-          static void *worker(void *arg)
-          {
-              tstat_t *st = arg;
 
-              cpu_set_t set; CPU_ZERO(&set); CPU_SET(st->id, &set);
-              pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+          // Основная функция потока для загрузки данных
+          void *download_worker(void *arg) {
+              thread_data_t *data = (thread_data_t *)arg;
+              int sockfd, bytes_received;
+              struct sockaddr_in serv_addr;
+              struct hostent *server;
+              char *buffer = malloc(BUFFER_SIZE);
+              if (!buffer) {
+                  error("ERROR allocating buffer");
+              }
+              
+              // Привязка потока к ядру (может не сработать в контейнеризированной среде GH Actions, но не критично)
+              cpu_set_t cpuset;
+              CPU_ZERO(&cpuset);
+              CPU_SET(data->thread_id % sysconf(_SC_NPROCESSORS_ONLN), &cpuset);
+              if (pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset) != 0) {
+                  fprintf(stderr, "Warning: Could not set thread affinity: %s\n", strerror(errno));
+              }
 
-              struct timespec t0, t1;
-              clock_gettime(CLOCK_MONOTONIC_RAW, &t0);
+              // Создание сокета
+              sockfd = socket(AF_INET, SOCK_STREAM, 0);
+              if (sockfd < 0) {
+                  error("ERROR opening socket");
+              }
 
-              if (!fetch_bytes(st->target))
-                  st->received = st->target;
-              else
-                  st->received = 0;
+              server = gethostbyname(HOST);
+              if (server == NULL) {
+                  fprintf(stderr, "ERROR, no such host\n");
+                  close(sockfd);
+                  free(buffer);
+                  pthread_exit(NULL);
+              }
 
-              clock_gettime(CLOCK_MONOTONIC_RAW, &t1);
-              st->dur = nsec(&t1) - nsec(&t0);
-              return NULL;
+              // Настройка адреса сервера
+              memset(&serv_addr, 0, sizeof(serv_addr));
+              serv_addr.sin_family = AF_INET;
+              serv_addr.sin_port = htons(PORT);
+              memcpy(&serv_addr.sin_addr.s_addr, server->h_addr, server->h_length);
+
+              // Подключение к серверу
+              if (connect(sockfd, (struct sockaddr *)&serv_addr, sizeof(serv_addr)) < 0) {
+                  error("ERROR connecting");
+              }
+
+              // Формирование и отправка HTTP GET запроса
+              char request[512];
+              sprintf(request, "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", data->path, HOST);
+              if (send(sockfd, request, strlen(request), 0) < 0) {
+                  error("ERROR writing to socket");
+              }
+
+              // Пропуск HTTP заголовков
+              char *header_end = NULL;
+              int total_header_len = 0;
+              while ((bytes_received = recv(sockfd, buffer + total_header_len, BUFFER_SIZE - total_header_len - 1, 0)) > 0) {
+                  total_header_len += bytes_received;
+                  buffer[total_header_len] = '\0';
+                  header_end = strstr(buffer, "\r\n\r\n");
+                  if (header_end) {
+                      header_end += 4; // Перемещаем указатель на начало тела ответа
+                      break;
+                  }
+              }
+
+              if(bytes_received <= 0 && !header_end) {
+                  error("ERROR finding HTTP header end");
+              }
+
+              long long body_bytes_in_first_recv = total_header_len - (header_end - buffer);
+              data->downloaded_bytes = body_bytes_in_first_recv;
+              
+              // Чтение тела ответа (данных файла)
+              while (data->downloaded_bytes < data->bytes_to_download && (bytes_received = recv(sockfd, buffer, BUFFER_SIZE, 0)) > 0) {
+                  data->downloaded_bytes += bytes_received;
+              }
+
+              if (bytes_received < 0) {
+                  perror("ERROR reading from socket");
+              }
+
+              close(sockfd);
+              free(buffer);
+              pthread_exit(NULL);
           }
-          /* —————————————————————————————————————————————————————————————————— */
-          int main(int argc, char **argv)
-          {
-              int threads = THREADS;
-              uint64_t bytes_per_thr = BYTES_PER_THREAD;
 
-              if (argc > 1) threads = atoi(argv[1]);
-              if (argc > 2) bytes_per_thr = strtoull(argv[2], 0, 10);
+          int main() {
+              pthread_t threads[NUM_THREADS];
+              thread_data_t thread_data[NUM_THREADS];
+              struct timespec start, end;
+              long long total_downloaded = 0;
 
-              if (threads < 1) threads = 1;
-              if (threads > 256) threads = 256;
+              printf("Starting network throughput test...\n");
+              printf("Total size to download: %llu bytes (%.2f GB)\n", TOTAL_BYTES, TOTAL_BYTES / (1024.0 * 1024.0 * 1024.0));
+              printf("Number of threads: %d\n\n", NUM_THREADS);
+              
+              unsigned long long bytes_per_thread = TOTAL_BYTES / NUM_THREADS;
 
-              pthread_t *tid   = calloc(threads, sizeof(*tid));
-              tstat_t   *stat  = calloc(threads, sizeof(*stat));
+              clock_gettime(CLOCK_MONOTONIC, &start);
 
-              printf("Launching %d threads, %lu bytes each (≈%.2f GiB total)\n",
-                     threads, (unsigned long)bytes_per_thr,
-                     threads*bytes_per_thr/1073741824.0);
+              // Создание потоков
+              for (int i = 0; i < NUM_THREADS; i++) {
+                  thread_data[i].thread_id = i;
+                  thread_data[i].bytes_to_download = bytes_per_thread;
+                  thread_data[i].downloaded_bytes = 0;
+                  snprintf(thread_data[i].path, sizeof(thread_data[i].path), PATH_TEMPLATE, bytes_per_thread);
 
-              for (int i = 0; i < threads; ++i) {
-                  stat[i].id = i;
-                  stat[i].target = bytes_per_thr;
-                  pthread_create(&tid[i], NULL, worker, &stat[i]);
+                  if (pthread_create(&threads[i], NULL, download_worker, &thread_data[i]) != 0) {
+                      error("ERROR creating thread");
+                  }
               }
 
-              double total_time = 0.0;
-              uint64_t total_bytes = 0;
-              for (int i = 0; i < threads; ++i) {
-                  pthread_join(tid[i], NULL);
-                  total_time   = (stat[i].dur > total_time) ? stat[i].dur : total_time;
-                  total_bytes += stat[i].received;
+              // Ожидание завершения всех потоков
+              for (int i = 0; i < NUM_THREADS; i++) {
+                  pthread_join(threads[i], NULL);
+                  total_downloaded += thread_data[i].downloaded_bytes;
               }
 
-              printf("\n== Aggregate ==\n");
-              printf("Bytes:   %.3f GiB\n", total_bytes/1073741824.0);
-              printf("Time:    %.3f s (longest thread)\n", total_time);
-              printf("Throughput: %.3f Gb/s\n",
-                     (total_bytes*8.0/1e9)/total_time);
+              clock_gettime(CLOCK_MONOTONIC, &end);
+
+              // Расчет и вывод результатов
+              double duration = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
+              if (duration == 0) duration = 1e-9; // Избегаем деления на ноль
+              double throughput_gbps = (total_downloaded * 8) / (duration * 1e9);
+              double throughput_mbps = throughput_gbps * 1000;
+
+              printf("\nTest finished.\n");
+              printf("Total bytes downloaded: %lld\n", total_downloaded);
+              printf("Time elapsed: %.4f seconds\n", duration);
+              printf("Throughput: %.2f Mbps (%.2f Gbps)\n", throughput_mbps, throughput_gbps);
 
               return 0;
           }
-          C_EOF
+          EOF
 
-      # 2) Сборка
-      - name: Build net_bench
-        run: |
-          gcc -O3 -pipe -pthread -march=native -flto net_bench.c -o net_bench
+      # Шаг 3: Компиляция кода с помощью gcc
+      - name: Compile C code
+        run: gcc -O3 -Wall -o network_test network_test.c -pthread
 
-      # 3) Мини-запуск (1 МБ), чтобы CI не докачался до лимитов
-      - name: Smoke-run (1 thread × 1 MiB)
-        run: |
-          ./net_bench
+      # Шаг 4: Запуск исполняемого файла с правами sudo
+      - name: Run network test
+        run: sudo ./network_test
