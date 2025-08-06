@@ -1,67 +1,186 @@
-name: 20x Ookla Speedtest
+name: Build & run net_bench (inline source)
+
 on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 jobs:
-  speedtest:
-    runs-on: ubuntu-latest       # noble 24.04
+  build-and-test:
+    runs-on: ubuntu-latest
 
     steps:
-    ##################################################################
-    # 1) Добавляем repo «jammy» + ключ (dearmored)
-    ##################################################################
-    - name: 🛠️ Install Ookla speedtest (jammy repo on noble)
-      run: |
-        set -e
+      # 0) (необязательно) чекаутим репо, вдруг там ещё что-то важно
+      - name: Checkout (optional)
+        uses: actions/checkout@v3
 
-        # базовые утилиты
-        sudo apt-get update -qq
-        sudo apt-get install -yqq curl gnupg2 ca-certificates zip
+      # 1) Создаём исходник net_bench.c прямо в раннере
+      - name: Create net_bench.c
+        shell: bash
+        run: |
+          cat > net_bench.c <<'C_EOF'
+          #define _GNU_SOURCE
+          #include <arpa/inet.h>
+          #include <errno.h>
+          #include <fcntl.h>
+          #include <netdb.h>
+          #include <netinet/tcp.h>
+          #include <pthread.h>
+          #include <sched.h>
+          #include <stdint.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <string.h>
+          #include <sys/socket.h>
+          #include <sys/time.h>
+          #include <sys/types.h>
+          #include <time.h>
+          #include <unistd.h>
 
-        # путь для ключей
-        sudo mkdir -p /etc/apt/keyrings
+          #ifndef  THREADS
+          #   define THREADS 4
+          #endif
+          #ifndef  BYTES_PER_THREAD
+          #   define BYTES_PER_THREAD (1ULL<<30)
+          #endif
+          #define HOST "speed.cloudflare.com"
+          #define PORT "80"
+          #define PATH "/__down?bytes="
 
-        # ⚠️  dearmor-ключ, чтобы apt его «увидел»
-        curl -fsSL https://packagecloud.io/ookla/speedtest-cli/gpgkey \
-          | sudo gpg --dearmor --yes -o /etc/apt/keyrings/ookla_speedtest.gpg
+          #define BUF_SZ   (1<<20)
+          #define SO_BUF   (1<<22)
 
-        # сам источник (jammy). Арх достаём программно.
-        ARCH=$(dpkg --print-architecture)
-        echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/ookla_speedtest.gpg] \
-              https://packagecloud.io/ookla/speedtest-cli/ubuntu/ jammy main" \
-          | sudo tee /etc/apt/sources.list.d/ookla_speedtest.list
+          static inline double nsec(const struct timespec *t)
+          {
+              return t->tv_sec + t->tv_nsec * 1e-9;
+          }
 
-        sudo apt-get update -qq
-        sudo apt-get install -yqq speedtest
-        speedtest --version
+          typedef struct {
+              uint64_t target;
+              uint64_t received;
+              double   dur;
+              int      id;
+          } tstat_t;
 
-    ##################################################################
-    # 2) 20 прогонов
-    ##################################################################
-    - name: 🚀 Run 20 speedtests
-      run: |
-        mkdir -p results
-        for i in $(seq -w 1 20); do
-          echo "► Test #$i"
-          speedtest --accept-license --accept-gdpr -f json \
-            > results/speedtest_$i.json
-        done
+          /* —————————————————————————————————————————————————————————————————— */
+          static int fetch_bytes(uint64_t nbytes)
+          {
+              struct addrinfo hints = { .ai_family = AF_INET, .ai_socktype = SOCK_STREAM };
+              struct addrinfo *rp, *res;
+              if (getaddrinfo(HOST, PORT, &hints, &res)) return -1;
 
-    ##################################################################
-    # 3) zip-архив
-    ##################################################################
-    - name: 📦 Zip results
-      run: |
-        ZIP_NAME="speedtests_$(date +%Y%m%d_%H%M%S).zip"
-        zip -qr "$ZIP_NAME" results
-        echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
+              int s = -1;
+              for (rp = res; rp; rp = rp->ai_next) {
+                  s = socket(rp->ai_family, rp->ai_socktype | SOCK_CLOEXEC, rp->ai_protocol);
+                  if (s == -1) continue;
+                  setsockopt(s, IPPROTO_TCP, TCP_NODELAY,  &(int){1}, 4);
+                  setsockopt(s, SOL_SOCKET,  SO_RCVBUF,    &(int){SO_BUF}, 4);
+                  if (!connect(s, rp->ai_addr, rp->ai_addrlen)) break;
+                  close(s); s = -1;
+              }
+              freeaddrinfo(res);
+              if (s == -1) return -1;
 
-    ##################################################################
-    # 4) upload-artifact v4
-    ##################################################################
-    - name: ⬆️ Upload artifact
-      uses: actions/upload-artifact@v4
-      with:
-        artifact-name: ${{ env.ZIP_NAME }}
-        path:          ${{ env.ZIP_NAME }}
-        retention-days: 30
+              char req[128];
+              int len = snprintf(req, sizeof(req),
+                                 "GET %s%lu HTTP/1.1\r\n"
+                                 "Host: " HOST "\r\n"
+                                 "Connection: close\r\n\r\n",
+                                 PATH, (unsigned long)nbytes);
+              if (write(s, req, len) != len) { close(s); return -1; }
+
+              static char *buf;
+              if (!buf && !(buf = aligned_alloc(64, BUF_SZ))) { close(s); return -1; }
+
+              size_t header_end = 0;
+              while (!header_end) {
+                  ssize_t r = read(s, buf, BUF_SZ);
+                  if (r <= 0) { close(s); return -1; }
+                  for (ssize_t i = 3; i < r; ++i)
+                      if (buf[i-3]=='\r' && buf[i-2]=='\n' &&
+                          buf[i-1]=='\r' && buf[i]=='\n') { header_end = i+1; nbytes -= (r - header_end); break; }
+              }
+
+              uint64_t got = 0;
+              while (got < nbytes) {
+                  ssize_t r = read(s, buf, BUF_SZ);
+                  if (r <= 0) break;
+                  got += r;
+              }
+              close(s);
+              return (got >= nbytes) ? 0 : -1;
+          }
+          /* —————————————————————————————————————————————————————————————————— */
+          static void *worker(void *arg)
+          {
+              tstat_t *st = arg;
+
+              cpu_set_t set; CPU_ZERO(&set); CPU_SET(st->id, &set);
+              pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+
+              struct timespec t0, t1;
+              clock_gettime(CLOCK_MONOTONIC_RAW, &t0);
+
+              if (!fetch_bytes(st->target))
+                  st->received = st->target;
+              else
+                  st->received = 0;
+
+              clock_gettime(CLOCK_MONOTONIC_RAW, &t1);
+              st->dur = nsec(&t1) - nsec(&t0);
+              return NULL;
+          }
+          /* —————————————————————————————————————————————————————————————————— */
+          int main(int argc, char **argv)
+          {
+              int threads = THREADS;
+              uint64_t bytes_per_thr = BYTES_PER_THREAD;
+
+              if (argc > 1) threads = atoi(argv[1]);
+              if (argc > 2) bytes_per_thr = strtoull(argv[2], 0, 10);
+
+              if (threads < 1) threads = 1;
+              if (threads > 256) threads = 256;
+
+              pthread_t *tid   = calloc(threads, sizeof(*tid));
+              tstat_t   *stat  = calloc(threads, sizeof(*stat));
+
+              printf("Launching %d threads, %lu bytes each (≈%.2f GiB total)\n",
+                     threads, (unsigned long)bytes_per_thr,
+                     threads*bytes_per_thr/1073741824.0);
+
+              for (int i = 0; i < threads; ++i) {
+                  stat[i].id = i;
+                  stat[i].target = bytes_per_thr;
+                  pthread_create(&tid[i], NULL, worker, &stat[i]);
+              }
+
+              double total_time = 0.0;
+              uint64_t total_bytes = 0;
+              for (int i = 0; i < threads; ++i) {
+                  pthread_join(tid[i], NULL);
+                  total_time   = (stat[i].dur > total_time) ? stat[i].dur : total_time;
+                  total_bytes += stat[i].received;
+              }
+
+              printf("\n== Aggregate ==\n");
+              printf("Bytes:   %.3f GiB\n", total_bytes/1073741824.0);
+              printf("Time:    %.3f s (longest thread)\n", total_time);
+              printf("Throughput: %.3f Gb/s\n",
+                     (total_bytes*8.0/1e9)/total_time);
+
+              return 0;
+          }
+          C_EOF
+
+      # 2) Сборка
+      - name: Build net_bench
+        run: |
+          gcc -O3 -pipe -pthread -march=native -flto net_bench.c -o net_bench
+
+      # 3) Мини-запуск (1 МБ), чтобы CI не докачался до лимитов
+      - name: Smoke-run (1 thread × 1 MiB)
+        run: |
+          ./net_bench
