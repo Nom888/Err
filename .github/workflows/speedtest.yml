@@ -1,0 +1,41 @@
+# .github/workflows/speedtest.yml
+name: 20x Ookla Speedtest
+
+on:
+  workflow_dispatch:       # запускаем вручную из вкладки Actions
+  schedule:
+    - cron: '0 */6 * * *'  # или автоматически каждые 6 часов (можете убрать)
+
+jobs:
+  speedtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🛠️ Установка speedtest-cli от Ookla
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gnupg1 curl zip
+          curl -s https://packagecloud.io/install/repositories/ookla/speedtest-cli/script.deb.sh | sudo bash
+          sudo apt-get install -y speedtest
+
+      - name: 🚀 Запускаем 20 тестов подряд
+        run: |
+          mkdir -p results
+          for i in $(seq -w 1 20); do
+            echo "► Тест #$i"
+            # -f json = формат JSON; уберите или замените, если нужен text/csv
+            speedtest -f json > results/speedtest_$i.json
+          done
+
+      - name: 📦 Создаём zip-архив
+        run: |
+          ZIP_NAME="speedtests_$(date +%Y%m%d_%H%M%S).zip"
+          zip -r "$ZIP_NAME" results
+          echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV   # сохраняем имя для следующего шага
+
+      - name: ⬆️ Загружаем архив как артефакт
+        uses: actions/upload-artifact@v3
+        with:
+          name: ${{ env.ZIP_NAME }}
+          path: ${{ env.ZIP_NAME }}
+          retention-days: 30         # хранить 30 дней (настраивается)
