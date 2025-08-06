@@ -1,42 +1,43 @@
-# .github/workflows/speedtest.yml
 name: 20x Ookla Speedtest
-
 on:
   workflow_dispatch:
-  schedule:
-    - cron: "0 */6 * * *"   # каждые 6 часов (уберите, если не нужно)
 
 jobs:
   speedtest:
-    runs-on: ubuntu-latest      # noble 24.04, всё ок
+    runs-on: ubuntu-latest       # noble 24.04
 
     steps:
-    ###################################################################
-    # 1. Добавляем jammy-репозиторий и ставим speedtest
-    ###################################################################
+    ##################################################################
+    # 1) Добавляем repo «jammy» + ключ (dearmored)
+    ##################################################################
     - name: 🛠️ Install Ookla speedtest (jammy repo on noble)
       run: |
         set -e
+
+        # базовые утилиты
         sudo apt-get update -qq
-        sudo apt-get install -yqq curl gnupg zip
+        sudo apt-get install -yqq curl gnupg2 ca-certificates zip
 
-        # Добавляем ключ
+        # путь для ключей
+        sudo mkdir -p /etc/apt/keyrings
+
+        # ⚠️  dearmor-ключ, чтобы apt его «увидел»
         curl -fsSL https://packagecloud.io/ookla/speedtest-cli/gpgkey \
-          | sudo tee /etc/apt/keyrings/ookla_speedtest.gpg > /dev/null
+          | sudo gpg --dearmor --yes -o /etc/apt/keyrings/ookla_speedtest.gpg
 
-        # Подписываем и указываем именно jammy
-        echo "deb [arch=$(dpkg --print-architecture) \
-              signed-by=/etc/apt/keyrings/ookla_speedtest.gpg] \
+        # сам источник (jammy). Арх достаём программно.
+        ARCH=$(dpkg --print-architecture)
+        echo "deb [arch=${ARCH} signed-by=/etc/apt/keyrings/ookla_speedtest.gpg] \
               https://packagecloud.io/ookla/speedtest-cli/ubuntu/ jammy main" \
           | sudo tee /etc/apt/sources.list.d/ookla_speedtest.list
 
         sudo apt-get update -qq
         sudo apt-get install -yqq speedtest
-        speedtest --version      # sanity-check
+        speedtest --version
 
-    ###################################################################
-    # 2. Запускаем 20 тестов
-    ###################################################################
+    ##################################################################
+    # 2) 20 прогонов
+    ##################################################################
     - name: 🚀 Run 20 speedtests
       run: |
         mkdir -p results
@@ -46,21 +47,21 @@ jobs:
             > results/speedtest_$i.json
         done
 
-    ###################################################################
-    # 3. Делаем zip-архив
-    ###################################################################
+    ##################################################################
+    # 3) zip-архив
+    ##################################################################
     - name: 📦 Zip results
       run: |
         ZIP_NAME="speedtests_$(date +%Y%m%d_%H%M%S).zip"
         zip -qr "$ZIP_NAME" results
         echo "ZIP_NAME=$ZIP_NAME" >> $GITHUB_ENV
 
-    ###################################################################
-    # 4. Загружаем артефакт (v4)
-    ###################################################################
+    ##################################################################
+    # 4) upload-artifact v4
+    ##################################################################
     - name: ⬆️ Upload artifact
       uses: actions/upload-artifact@v4
       with:
-        artifact-name: ${{ env.ZIP_NAME }}   # v4 → artifact-name
-        path: ${{ env.ZIP_NAME }}
+        artifact-name: ${{ env.ZIP_NAME }}
+        path:          ${{ env.ZIP_NAME }}
         retention-days: 30
