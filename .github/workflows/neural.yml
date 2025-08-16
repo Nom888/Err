@@ -10,6 +10,6 @@ jobs:
       - name: Neural start
         shell: bash
         run: |
-          pv
+          sudo apt install pv
           bunzip2
           aria2c -x16 -s16 "https://dumps.wikimedia.org/ruwiki/latest/ruwiki-latest-pages-articles.xml.bz2"
