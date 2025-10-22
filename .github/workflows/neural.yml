@@ -1,7 +1,7 @@
 name: Run main.py and upload result
 
 on:
-  workflow_dispatch:  # Позволяет запускать вручную из вкладки Actions
+  workflow_dispatch:
 
 jobs:
   run-script:
@@ -24,8 +24,17 @@ jobs:
       - name: Run main.py
         run: python main.py
 
+      - name: Check if epta.txt exists
+        id: check_file
+        run: |
+          if [ -f "epta.txt" ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Upload epta.txt
-        if: success() && exists('epta.txt')
+        if: success() && steps.check_file.outputs.exists == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: epta
