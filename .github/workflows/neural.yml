@@ -1,16 +1,32 @@
-name: Neural
+name: Run main.py and upload result
 
-on: workflow_dispatch
+on:
+  workflow_dispatch:  # Позволяет запускать вручную из вкладки Actions
 
 jobs:
-  run:
+  run-script:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - name: Neural start
-        shell: bash
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
         run: |
-          sudo apt install pv
-          aria2c -x16 -s16 "https://dumps.wikimedia.org/ruwiki/latest/ruwiki-latest-pages-articles.xml.bz2"
-          pv ruwiki-latest-pages-articles.xml.bz2 | bunzip2 > ruwiki-latest-pages-articles.xml
-          file ruwiki-latest-pages-articles.xml
+          python -m pip install --upgrade pip
+          pip install git+https://github.com/MatrixTM/PyRoxy.git requests colorama
+
+      - name: Run main.py
+        run: python main.py
+
+      - name: Upload epta.txt
+        if: success() && exists('epta.txt')
+        uses: actions/upload-artifact@v4
+        with:
+          name: epta
+          path: epta.txt
